@@ -1,7 +1,8 @@
 # Python 3.11 recommended
 # Core for PDF diff
-PyMuPDF>=1.24,<1.26
-rapidfuzz>=3.9,<4
+
+pdfplumber>=0.11,<0.12
+diff-match-patch>=20230430
 regex>=2024.4
 
 # Core for DOCX diff

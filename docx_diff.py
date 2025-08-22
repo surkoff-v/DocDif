@@ -1,309 +1,173 @@
 #!/usr/bin/env python3
-# pip install mammoth beautifulsoup4 rapidfuzz diff-match-patch python-docx regex
-# (опционально, если хотите ещё и Markdown)
-# pip install markdownify
+# -*- coding: utf-8 -*-
+"""
+Кроссплатформенный DOCX diff (side-by-side):
+- Извлекает текст из .docx через Mammoth (в Markdown-подобный плоский текст)
+- Нормализует переносы/пробелы
+- Делит на "предложения" (простая эвристика)
+- Выравнивает списки предложений с difflib.SequenceMatcher
+- Рисует HTML-отчёт: слева "старое" (с <del>), справа "новое" (с <ins>)
+"""
 
-
-import argparse, json, pathlib, regex as re
+import argparse, pathlib, re, json
 from dataclasses import dataclass
-from typing import List, Tuple, Dict, Optional
-
+from typing import List, Dict, Tuple
+from difflib import SequenceMatcher
 import mammoth
-from bs4 import BeautifulSoup, NavigableString, Tag
-from rapidfuzz import fuzz, process
-from diff_match_patch import diff_match_patch
-from docx import Document
-from docx.shared import RGBColor
 
-WS = re.compile(r'\s+')
+# ---------- Нормализация ----------
+WS = re.compile(r"\s+")
+SENT_SPLIT = re.compile(r'(?<=[\.\!\?])\s+(?=[A-ZА-Я0-9])', re.UNICODE)
 
-def norm(txt: str) -> str:
-    return WS.sub(' ', (txt or '').replace('\xa0', ' ')).strip()
+def normalize(s: str) -> str:
+    if not s:
+        return ""
+    s = s.replace("\xa0"," ").replace("\r","")
+    s = WS.sub(" ", s).strip()
+    return s
+
+def to_sentences(txt: str) -> List[str]:
+    txt = normalize(txt)
+    if not txt:
+        return []
+    if SENT_SPLIT.search(txt):
+        return [p.strip() for p in SENT_SPLIT.split(txt) if p.strip()]
+    return [txt]
 
 @dataclass
-class Block:
-    idx: int
-    section: str
-    kind: str   # p|li|th|td|caption|h1|h2|h3...
+class Sentence:
     text: str
+    # (страниц в DOCX нет в чистом виде; оставляем только текст)
 
-def docx_to_html(path: str) -> str:
-    with open(path, 'rb') as f:
-        return mammoth.convert_to_html(f).value
+# ---------- Извлечение текста из DOCX ----------
+def docx_to_text(path: str) -> str:
+    """Берём Markdown из Mammoth и приводим к плоскому тексту."""
+    with open(path, "rb") as f:
+        md = mammoth.convert_to_markdown(f).value
+    # уберём markdown-разметку по минимуму (**, __, #, *, >) — чтобы difflib не путался
+    md = re.sub(r"[*_`>#~-]+", " ", md)
+    return normalize(md)
 
-def html_to_blocks(html: str) -> List[Block]:
-    soup = BeautifulSoup(html, 'html.parser')
-    blocks: List[Block] = []
-    hstack: List[str] = []
+def extract_sentences(path: str) -> List[Sentence]:
+    txt = docx_to_text(path)
+    return [Sentence(s) for s in to_sentences(txt)]
 
-    def section_path() -> str:
-        return " > ".join(hstack)
+# ---------- Diff utils ----------
+def token_diff(a: str, b: str) -> List[Tuple[str,str]]:
+    """Покомпонентный diff по словам для красивой подсветки."""
+    A, B = a.split(), b.split()
+    sm2 = SequenceMatcher(a=A, b=B, autojunk=False)
+    parts: List[Tuple[str,str]] = []
+    for tag,i1,i2,j1,j2 in sm2.get_opcodes():
+        if tag == "equal":
+            parts.append(("eq"," ".join(A[i1:i2])))
+        elif tag == "delete":
+            parts.append(("del"," ".join(A[i1:i2])))
+        elif tag == "insert":
+            parts.append(("ins"," ".join(B[j1:j2])))
+        elif tag == "replace":
+            if i1<i2: parts.append(("del"," ".join(A[i1:i2])))
+            if j1<j2: parts.append(("ins"," ".join(B[j1:j2])))
+    return parts
 
-    idx = 0
-    def add_block(kind: str, text: str):
-        nonlocal idx
-        t = norm(text)
-        if t:
-            blocks.append(Block(idx=idx, section=section_path(), kind=kind, text=t))
-            idx += 1
-
-    for el in soup.recursiveChildGenerator():
-        if isinstance(el, Tag):
-            tag = el.name.lower()
-            if tag in ('h1','h2','h3','h4'):
-                # обновляем стек секций
-                level = int(tag[1])
-                while len(hstack) >= level:
-                    hstack.pop()
-                hstack.append(norm(el.get_text(' ')))
-                add_block(tag, el.get_text(' '))
-            elif tag in ('p','li','th','td','caption'):
-                add_block(tag, el.get_text(' '))
-    return blocks
-
-def build_index_text(blocks: List[Block]) -> List[str]:
-    return [b.text for b in blocks]
-
-def align_blocks(old: List[Block], new: List[Block], sim_threshold: int = 85
-                ) -> Tuple[Dict[int,int], List[int], List[int], Dict[int,int]]:
-    """
-    Возвращает:
-    - matches: old_idx -> new_idx
-    - old_only: индексы старых, без пары (delete)
-    - new_only: индексы новых, без пары (insert)
-    - sim_scores: old_idx -> similarity (0..100) для совпавших
-    """
-    matches: Dict[int,int] = {}
-    sim_scores: Dict[int,int] = {}
-    new_available = set(range(len(new)))
-
-    # 1) точные совпадения
-    txt2idx_new: Dict[str, List[int]] = {}
-    for j, b in enumerate(new):
-        txt2idx_new.setdefault(b.text, []).append(j)
-    for i, b in enumerate(old):
-        js = txt2idx_new.get(b.text)
-        if js:
-            j = js.pop(0)
-            matches[i] = j
-            sim_scores[i] = 100
-            if not js:
-                txt2idx_new.pop(b.text, None)
-            if j in new_available:
-                new_available.remove(j)
-
-    # 2) «похожие» (RapidFuzz)
-    old_unmatched = [i for i in range(len(old)) if i not in matches]
-    new_unmatched = list(new_available)
-    new_choices = {j: new[j].text for j in new_unmatched}
-
-    for i in old_unmatched:
-        if not new_choices: break
-        query = old[i].text
-        # ищем ближайший кандидат
-        best = process.extractOne(
-            query, new_choices, scorer=fuzz.token_set_ratio, score_cutoff=sim_threshold
-        )
-        if best:
-            candidate_text, score, j = best
-            matches[i] = j
-            sim_scores[i] = int(score)
-            new_choices.pop(j, None)
-
-    # считаем хвосты
-    old_only = [i for i in range(len(old)) if i not in matches]
-    new_matched = set(matches.values())
-    new_only = [j for j in range(len(new)) if j not in new_matched]
-    return matches, old_only, new_only, sim_scores
-
-def tokenize_words(s: str) -> List[str]:
-    # Токенизация «по словам/знакам», чтобы дифф был не по символам.
-    tokens = re.findall(r'\w+|[^\w\s]', s, flags=re.UNICODE)
-    return tokens
-
-def diff_words(a: str, b: str) -> List[Tuple[str,str]]:
-    """
-    Возвращает список кортежей (op, text), где op: 'eq'|'del'|'ins'
-    """
-    # Переводим в «строку из токенов» для dmp
-    A = tokenize_words(a); B = tokenize_words(b)
-    SEP = '\uF000'  # редкий разделитель
-    dmp = diff_match_patch()
-    diffs = dmp.diff_main(SEP.join(A), SEP.join(B))
-    dmp.diff_cleanupSemantic(diffs)
-
-    out: List[Tuple[str,str]] = []
-    for op, s in diffs:
-        parts = [p for p in s.split(SEP) if p != '']
-        if not parts: continue
-        text = ' '.join(parts)
-        if op == 0: out.append(('eq', text))
-        elif op == -1: out.append(('del', text))
-        else: out.append(('ins', text))
-    return out
-
-def render_html(old_blocks: List[Block], new_blocks: List[Block],
-                matches: Dict[int,int], old_only: List[int], new_only: List[int],
-                sim_scores: Dict[int,int], out_path: str):
-    rows = []
-    def mark(parts: List[Tuple[str,str]]):
-        left, right = [], []
-        for op, t in parts:
-            if op == 'eq': left.append(t); right.append(t)
-            if op == 'del': left.append(f'<del>{t}</del>')
-            if op == 'ins': right.append(f'<ins>{t}</ins>')
-        return ' '.join(left), ' '.join(right)
-
-    # заменённые/совпавшие
-    for i, j in sorted(matches.items()):
-        ob, nb = old_blocks[i], new_blocks[j]
-        if ob.text == nb.text:
-            # ничего не рисуем? всё равно покажем как "eq"
-            parts = [('eq', ob.text)]
+def align_sentence_lists(old: List[Sentence], new: List[Sentence]) -> List[Dict]:
+    sm = SequenceMatcher(a=[s.text for s in old], b=[s.text for s in new], autojunk=False)
+    diffs: List[Dict] = []
+    for tag, i1, i2, j1, j2 in sm.get_opcodes():
+        if tag == "equal":
+            continue
+        if tag in ("replace","delete"):
+            for i in range(i1, i2):
+                diffs.append({"type":"delete","old_text":old[i].text})
+        if tag in ("replace","insert"):
+            for j in range(j1, j2):
+                diffs.append({"type":"insert","new_text":new[j].text})
+    # Схлопнем попарно delete+insert в replace
+    merged: List[Dict] = []
+    k = 0
+    while k < len(diffs):
+        d = diffs[k]
+        if d["type"]=="delete" and k+1<len(diffs) and diffs[k+1]["type"]=="insert":
+            rep = {
+                "type":"replace",
+                "old_text": d["old_text"],
+                "new_text": diffs[k+1]["new_text"],
+                "parts": token_diff(d["old_text"], diffs[k+1]["new_text"])
+            }
+            merged.append(rep); k += 2
         else:
-            parts = diff_words(ob.text, nb.text)
-        left, right = mark(parts)
-        sec = ob.section or nb.section
-        sim = sim_scores.get(i, 0)
-        rows.append(f"""
-        <tr>
-          <td><small>old #{i} • {sec} • {ob.kind} • sim:{sim}</small><div>{left}</div></td>
-          <td><small>new #{j} • {sec} • {nb.kind} • sim:{sim}</small><div>{right}</div></td>
-        </tr>""")
-
-    # удалённые
-    for i in old_only:
-        ob = old_blocks[i]
-        left = f'<del>{ob.text}</del>'
-        rows.append(f"""
-        <tr>
-          <td><small>old #{i} • {ob.section} • {ob.kind}</small><div>{left}</div></td>
-          <td><small>—</small><div></div></td>
-        </tr>""")
-
-    # добавленные
-    for j in new_only:
-        nb = new_blocks[j]
-        right = f'<ins>{nb.text}</ins>'
-        rows.append(f"""
-        <tr>
-          <td><small>—</small><div></div></td>
-          <td><small>new #{j} • {nb.section} • {nb.kind}</small><div>{right}</div></td>
-        </tr>""")
-
-    html = f"""<!doctype html><html lang="ru"><head><meta charset="utf-8">
-    <title>DOCX diff</title>
-    <style>
-    body{{font-family:system-ui,Segoe UI,Roboto,Arial;}}
-    table{{width:100%;border-collapse:collapse}}
-    td{{vertical-align:top;width:50%;border:1px solid #ddd;padding:10px}}
-    del{{background:#ffecec;text-decoration:line-through}}
-    ins{{background:#eaffea;text-decoration:none}}
-    small{{color:#666}}
-    </style></head><body>
-    <h2>Сравнение DOCX</h2>
-    <table>{''.join(rows)}</table>
-    </body></html>"""
-    pathlib.Path(out_path).write_text(html, encoding='utf-8')
-
-def build_changes_json(old_blocks: List[Block], new_blocks: List[Block],
-                       matches: Dict[int,int], old_only: List[int], new_only: List[int],
-                       sim_scores: Dict[int,int]) -> List[dict]:
-    changes = []
-    for i, j in sorted(matches.items()):
-        a, b = old_blocks[i], new_blocks[j]
-        if a.text != b.text:
-            dif = diff_words(a.text, b.text)
-            # найдём изменённые числа/даты/проценты
-            nums_old = set(re.findall(r'\d+[.,]?\d*%?', a.text))
-            nums_new = set(re.findall(r'\d+[.,]?\d*%?', b.text))
-            if nums_old != nums_new:
-                num_change = {'old': sorted(nums_old), 'new': sorted(nums_new)}
+            if d["type"]=="delete":
+                merged.append({"type":"delete","old_text":d["old_text"],"parts":token_diff(d["old_text"], "")})
             else:
-                num_change = None
-            changes.append({
-                'type': 'replace',
-                'old_idx': i, 'new_idx': j,
-                'section': a.section or b.section,
-                'similarity': sim_scores.get(i, 0),
-                'old_text': a.text, 'new_text': b.text,
-                'token_diff': dif,
-                'numbers_changed': num_change
-            })
-    for i in old_only:
-        a = old_blocks[i]
-        changes.append({'type': 'delete','old_idx': i,'section': a.section,'old_text': a.text})
-    for j in new_only:
-        b = new_blocks[j]
-        changes.append({'type': 'insert','new_idx': j,'section': b.section,'new_text': b.text})
-    return changes
+                merged.append({"type":"insert","new_text":d["new_text"],"parts":token_diff("", d["new_text"])})
+            k += 1
+    return merged
 
-def render_docx(changes: List[dict], out_path: str):
-    """Генерирует .docx с визуальной подсветкой (не Track Changes)."""
-    doc = Document()
-    doc.add_heading('DOCX Diff (visual)', level=1)
+# ---------- HTML отчёт ----------
+def _mark(parts: List[Tuple[str,str]]) -> Tuple[str,str]:
+    left, right = [], []
+    for op, t in parts:
+        if not t:
+            continue
+        if op == "eq":
+            left.append(t); right.append(t)
+        elif op == "del":
+            left.append(f"<del>{t}</del>")
+        elif op == "ins":
+            right.append(f"<ins>{t}</ins>")
+    return " ".join(left), " ".join(right)
 
-    def add_run(par, text, op):
-        run = par.add_run(text)
-        if op == 'del':
-            run.font.color.rgb = RGBColor(0xCC, 0x00, 0x00)
-            run.font.strike = True
-        elif op == 'ins':
-            run.font.color.rgb = RGBColor(0x00, 0x66, 0x00)
-            run.underline = True
+def write_html(diffs: List[Dict], path: str):
+    rows = []
+    for d in diffs:
+        if d["type"]=="replace":
+            l, r = _mark(d["parts"])
+        elif d["type"]=="delete":
+            l, r = _mark(d["parts"])
+        else:
+            l, r = _mark(d["parts"])
+        rows.append(f"""
+        <tr>
+          <td><div>{l}</div></td>
+          <td><div>{r}</div></td>
+        </tr>""")
 
-    for ch in changes:
-        if ch['type'] == 'replace':
-            par = doc.add_paragraph()
-            par.add_run(f"[{ch.get('section','')}] ").bold = True
-            for op, t in ch['token_diff']:
-                if op == 'eq': par.add_run(t + ' ')
-                elif op in ('del','ins'): add_run(par, t + ' ', op)
-        elif ch['type'] == 'delete':
-            par = doc.add_paragraph()
-            add_run(par, ch['old_text'], 'del')
-        elif ch['type'] == 'insert':
-            par = doc.add_paragraph()
-            add_run(par, ch['new_text'], 'ins')
-    doc.save(out_path)
+    html = """<!doctype html><html lang="ru"><head><meta charset="utf-8">
+<title>DOCX diff (side-by-side)</title>
+<style>
+body{font-family:system-ui,Segoe UI,Roboto,Arial}
+table{width:100%;border-collapse:collapse}
+td{vertical-align:top;width:50%;border:1px solid #ddd;padding:10px}
+del{background:#ffecec;text-decoration:line-through}
+ins{background:#eaffea;text-decoration:none}
+</style></head><body>
+<h2>Text diff</h2>
+<table>""" + "".join(rows) + "</table></body></html>"
+    pathlib.Path(path).write_text(html, encoding="utf-8")
 
+# ---------- CLI ----------
 def main():
-    ap = argparse.ArgumentParser(description="DOCX diff (Python)")
-    ap.add_argument('old_docx')
-    ap.add_argument('new_docx')
-    ap.add_argument('--out', default='out')
-    ap.add_argument('--threshold', type=int, default=85,
-                    help='Порог похожести блоков (0..100), по RapidFuzz token_set_ratio')
+    ap = argparse.ArgumentParser(description="DOCX side-by-side text diff (Mammoth + difflib)")
+    ap.add_argument("old_docx"); ap.add_argument("new_docx")
+    ap.add_argument("--out", default="out_docx_diff")
     args = ap.parse_args()
 
-    out_dir = pathlib.Path(args.out)
-    out_dir.mkdir(parents=True, exist_ok=True)
+    out = pathlib.Path(args.out); out.mkdir(parents=True, exist_ok=True)
 
-    old_html = docx_to_html(args.old_docx)
-    new_html = docx_to_html(args.new_docx)
-    old_blocks = html_to_blocks(old_html)
-    new_blocks = html_to_blocks(new_html)
+    old_sents = extract_sentences(args.old_docx)
+    new_sents = extract_sentences(args.new_docx)
 
-    matches, old_only, new_only, sim_scores = align_blocks(old_blocks, new_blocks, args.threshold)
-    changes = build_changes_json(old_blocks, new_blocks, matches, old_only, new_only, sim_scores)
+    diffs = align_sentence_lists(old_sents, new_sents)
 
-    # HTML
-    render_html(old_blocks, new_blocks, matches, old_only, new_only, sim_scores,
-                str(out_dir / 'diff.html'))
-    # JSON
-    (out_dir / 'changes.json').write_text(json.dumps(changes, ensure_ascii=False, indent=2), encoding='utf-8')
-    # DOCX (визуальный)
-    render_docx(changes, str(out_dir / 'diff.docx'))
+    # JSON на всякий случай
+    (out/"diff.json").write_text(json.dumps(diffs, ensure_ascii=False, indent=2), encoding="utf-8")
+    write_html(diffs, str(out/"diff_docx.html"))
 
     print(json.dumps({
-        "html_report": str(out_dir / "diff.html"),
-        "json": str(out_dir / "changes.json"),
-        "docx_visual": str(out_dir / "diff.docx"),
-        "stats": {
-            "old_blocks": len(old_blocks), "new_blocks": len(new_blocks),
-            "matched": len(matches), "deleted": len(old_only), "inserted": len(new_only)
-        }
-    }, ensure_ascii=False))
+        "html_report": str(out/"diff_docx.html"),
+        "json": str(out/"diff.json"),
+        "stats": {"old_sentences": len(old_sents), "new_sentences": len(new_sents), "diff_items": len(diffs)}
+    }, ensure_ascii=False, indent=2))
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()

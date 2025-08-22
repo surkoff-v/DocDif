@@ -1,164 +1,166 @@
-# pdf_text_diff.py
-#
-# pip install pymupdf rapidfuzz regex beautifulsoup4 
-# при необходимости pytesseract, pdf2image
-#
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Clean PDF text diff using pdfplumber + difflib only.
+- Извлекает текст через pdfplumber (pdfminer.six)
+- Нормализует переносы и пробелы
+- Делит на предложения
+- Сравнивает списки предложений с difflib.SequenceMatcher
+- Результат: JSON + HTML с <del>/<ins>
+"""
 
-
-import sys, json, re, pathlib
+import argparse, re, json, pathlib
 from dataclasses import dataclass
-import fitz  # PyMuPDF
+from typing import List, Dict, Tuple
 from difflib import SequenceMatcher
 
-SENT_SPLIT = re.compile(r'(?<=[\.\!\?])\s+(?=[A-ZА-Я0-9])')
-HYPHEN_JOIN = re.compile(r'(\w)-\n(\w)')  # изъятие переносов
-WS = re.compile(r'\s+')
+# -------- нормализация --------
+WS = re.compile(r"\s+")
+HYPHEN = re.compile(r"(\w)-\n(\w)")
+SENT_SPLIT = re.compile(r'(?<=[\.\!\?])\s+(?=[A-ZА-Я0-9])', re.UNICODE)
+
+def normalize(s: str) -> str:
+    if not s: return ""
+    s = s.replace("\r", "")
+    s = HYPHEN.sub(r"\1\2", s)    # убираем переносы по дефису
+    s = s.replace("\n", " ")
+    s = WS.sub(" ", s).strip()
+    return s
+
+def to_sentences(txt: str) -> List[str]:
+    txt = normalize(txt)
+    if not txt: return []
+    if SENT_SPLIT.search(txt):
+        return [p.strip() for p in SENT_SPLIT.split(txt) if p.strip()]
+    return [txt]
 
 @dataclass
 class Sentence:
     text: str
     page: int
-    section_path: str  # например "2.1>Требования>SLA" (можно заполнять позже)
 
-def normalize(txt: str) -> str:
-    txt = txt.replace('\r', '')
-    txt = HYPHEN_JOIN.sub(r'\1\2', txt)
-    txt = txt.replace('\n', ' ')
-    txt = WS.sub(' ', txt).strip()
-    return txt
+# -------- извлечение текста --------
+def extract_pdfplumber(path: str) -> List[Sentence]:
+    import pdfplumber
+    out: List[Sentence] = []
+    with pdfplumber.open(path) as pdf:
+        for i, page in enumerate(pdf.pages):
+            txt = page.extract_text() or ""
+            for s in to_sentences(txt):
+                out.append(Sentence(s, i+1))
+    return out
 
-def extract_sentences(pdf_path: str) -> list[Sentence]:
-    doc = fitz.open(pdf_path)
-    result = []
-    for pno in range(len(doc)):
-        page = doc[pno]
-        # Берём текст странично; при желании можно пройтись по блокам.
-        txt = page.get_text()
-        txt = normalize(txt)
-        if not txt:
-            continue
-        for s in SENT_SPLIT.split(txt):
-            s = s.strip()
-            if s:
-                result.append(Sentence(s, pno + 1, ""))  # страницы 1-базные
-    return result
-
-def token_diff(a: str, b: str):
-    a_tok = a.split()
-    b_tok = b.split()
-    sm = SequenceMatcher(a=a_tok, b=b_tok, autojunk=False)
-    chunks = []
+# -------- дифф --------
+def token_diff(a: str, b: str) -> List[Tuple[str,str]]:
+    A, B = a.split(), b.split()
+    sm = SequenceMatcher(a=A, b=B, autojunk=False)
+    out: List[Tuple[str,str]] = []
     for tag, i1, i2, j1, j2 in sm.get_opcodes():
-        chunks.append((tag, ' '.join(a_tok[i1:i2]), ' '.join(b_tok[j1:j2])))
-    return chunks
+        if tag == "equal":
+            out.append(("eq"," ".join(A[i1:i2])))
+        elif tag == "delete":
+            out.append(("del"," ".join(A[i1:i2])))
+        elif tag == "insert":
+            out.append(("ins"," ".join(B[j1:j2])))
+        elif tag == "replace":
+            if i1<i2: out.append(("del"," ".join(A[i1:i2])))
+            if j1<j2: out.append(("ins"," ".join(B[j1:j2])))
+    return out
 
-def sentence_align(old: list[Sentence], new: list[Sentence]):
-    # Базовое выравнивание по предложениям (позиционный SequenceMatcher).
+def align_sentence_lists(old: List[Sentence], new: List[Sentence]) -> List[Dict]:
     sm = SequenceMatcher(a=[s.text for s in old], b=[s.text for s in new], autojunk=False)
-    diffs = []
+    diffs: List[Dict] = []
     for tag, i1, i2, j1, j2 in sm.get_opcodes():
-        if tag == 'equal':
-            continue
-        if tag in ('replace', 'delete'):
+        if tag == "equal": continue
+        if tag in ("replace","delete"):
             for i in range(i1, i2):
-                diffs.append({
-                    'type': 'delete',
-                    'old_text': old[i].text,
-                    'old_page': old[i].page,
-                    'new_text': '',
-                    'new_page': None,
-                    'tokens': token_diff(old[i].text, new[j1].text) if tag == 'replace' and j1 < j2 else []
-                })
-        if tag in ('replace', 'insert'):
+                diffs.append({"type":"delete", "old_text":old[i].text, "old_page":old[i].page})
+        if tag in ("replace","insert"):
             for j in range(j1, j2):
-                diffs.append({
-                    'type': 'insert',
-                    'old_text': '',
-                    'old_page': None,
-                    'new_text': new[j].text,
-                    'new_page': new[j].page,
-                    'tokens': token_diff(old[i1].text, new[j].text) if tag == 'replace' and i1 < i2 else []
-                })
-    return diffs
-
-def html_report(diffs: list[dict], out_html: str):
-    def mark_tokens(tokens):
-        parts_old, parts_new = [], []
-        for tag, a, b in tokens:
-            if tag == 'equal':
-                parts_old.append(a); parts_new.append(b)
-            elif tag in ('delete', 'replace'):
-                if a: parts_old.append(f'<del>{a}</del>')
-            if tag in ('insert', 'replace'):
-                if b: parts_new.append(f'<ins>{b}</ins>')
-        return ' '.join(parts_old), ' '.join(parts_new)
-
-    rows = []
-    for d in diffs:
-        if d['type'] == 'delete' and d['tokens']:
-            left, right = mark_tokens(d['tokens'])
-        elif d['type'] == 'insert' and d['tokens']:
-            left, right = mark_tokens(d['tokens'])
+                diffs.append({"type":"insert", "new_text":new[j].text, "new_page":new[j].page})
+    # схлопываем delete+insert в replace
+    merged: List[Dict] = []
+    k = 0
+    while k < len(diffs):
+        d = diffs[k]
+        if d["type"]=="delete" and k+1<len(diffs) and diffs[k+1]["type"]=="insert":
+            rep = {
+                "type":"replace",
+                "old_text": d["old_text"], "old_page": d["old_page"],
+                "new_text": diffs[k+1]["new_text"], "new_page": diffs[k+1]["new_page"],
+                "parts": token_diff(d["old_text"], diffs[k+1]["new_text"])
+            }
+            merged.append(rep); k+=2
         else:
-            left, right = (d['old_text'] or ''), (d['new_text'] or '')
+            if d["type"]=="delete":
+                merged.append({"type":"delete","old_text":d["old_text"],"old_page":d["old_page"],
+                               "parts": token_diff(d["old_text"], "")})
+            else:
+                merged.append({"type":"insert","new_text":d["new_text"],"new_page":d["new_page"],
+                               "parts": token_diff("", d["new_text"])})
+            k+=1
+    return merged
+
+# -------- HTML отчёт --------
+def _mark(parts: List[Tuple[str,str]]):
+    l=[]; r=[]
+    for op,t in parts:
+        if not t: continue
+        if op=="eq": l.append(t); r.append(t)
+        elif op=="del": l.append(f"<del>{t}</del>")
+        elif op=="ins": r.append(f"<ins>{t}</ins>")
+    return " ".join(l), " ".join(r)
+
+def write_html(diffs: List[Dict], path: str):
+    rows=[]
+    for d in diffs:
+        if d["type"]=="replace":
+            left,right=_mark(d["parts"]); lp=d["old_page"]; rp=d["new_page"]
+        elif d["type"]=="delete":
+            left,right=_mark(d["parts"]); lp=d["old_page"]; rp=""
+        else:
+            left,right=_mark(d["parts"]); lp=""; rp=d["new_page"]
         rows.append(f"""
         <tr>
-          <td><small>p.{d.get('old_page') or ''}</small><div>{left}</div></td>
-          <td><small>p.{d.get('new_page') or ''}</small><div>{right}</div></td>
+          <td><small>p.{lp}</small><div>{left}</div></td>
+          <td><small>p.{rp}</small><div>{right}</div></td>
         </tr>""")
-    html = f"""
-    <html><head><meta charset="utf-8">
-    <style>
-    body{{font-family:system-ui,Segoe UI,Roboto,Arial;}}
-    table{{width:100%;border-collapse:collapse}}
-    td{{vertical-align:top;width:50%;border:1px solid #ddd;padding:8px}}
-    del{{background:#ffecec;text-decoration:line-through}}
-    ins{{background:#eaffea;text-decoration:none}}
-    small{{color:#666}}
-    </style></head><body>
-    <h2>Text diff</h2>
-    <table>{''.join(rows)}</table>
-    </body></html>"""
-    pathlib.Path(out_html).write_text(html, encoding='utf-8')
+    html = """<!doctype html><html lang="en"><head><meta charset="utf-8">
+<title>PDF diff (pdfplumber + difflib)</title>
+<style>
+body{font-family:system-ui,Segoe UI,Roboto,Arial}
+table{width:100%;border-collapse:collapse}
+td{vertical-align:top;width:50%;border:1px solid #ddd;padding:10px}
+del{background:#ffecec;text-decoration:line-through}
+ins{background:#eaffea;text-decoration:none}
+small{color:#666}
+</style></head><body>
+<h2>Text diff</h2>
+<table>""" + "".join(rows) + "</table></body></html>"
+    pathlib.Path(path).write_text(html, encoding="utf-8")
 
-def annotate_pdf(pdf_in: str, phrases: list[tuple[int, str]], pdf_out: str):
-    # phrases: list of (page_number, phrase) для подсветки
-    doc = fitz.open(pdf_in)
-    for pno, phrase in phrases:
-        try:
-            page = doc[pno - 1]
-        except: 
-            continue
-        for rect in page.search_for(phrase, hit_max=16):
-            page.add_highlight_annot(rect)
-    doc.save(pdf_out, incremental=False)
+# -------- CLI --------
+def main():
+    ap = argparse.ArgumentParser(description="Clean PDF text diff (pdfplumber + difflib)")
+    ap.add_argument("old_pdf"); ap.add_argument("new_pdf")
+    ap.add_argument("--out", default="out")
+    args = ap.parse_args()
 
-def main(old_pdf: str, new_pdf: str, out_dir: str):
-    out = pathlib.Path(out_dir); out.mkdir(parents=True, exist_ok=True)
-    old_sents = extract_sentences(old_pdf)
-    new_sents = extract_sentences(new_pdf)
-    diffs = sentence_align(old_sents, new_sents)
+    outdir = pathlib.Path(args.out); outdir.mkdir(parents=True, exist_ok=True)
 
-    # Сохраняем JSON
-    json_path = out / "diff.json"
-    json_path.write_text(json.dumps(diffs, ensure_ascii=False, indent=2), encoding='utf-8')
+    old = extract_pdfplumber(args.old_pdf)
+    new = extract_pdfplumber(args.new_pdf)
 
-    # HTML отчёт
-    html_report(diffs, str(out / "diff.html"))
+    diffs = align_sentence_lists(old, new)
 
-    # Подсветки: удалённые → в старом, добавленные → в новом
-    del_phr = [(d['old_page'], d['old_text']) for d in diffs if d['type']=='delete' and d['old_text']]
-    ins_phr = [(d['new_page'], d['new_text']) for d in diffs if d['type']=='insert' and d['new_text']]
-    annotate_pdf(old_pdf, del_phr[:200], str(out / "old_annotated.pdf"))
-    annotate_pdf(new_pdf, ins_phr[:200], str(out / "new_annotated.pdf"))
+    (outdir/"diff.json").write_text(json.dumps(diffs, ensure_ascii=False, indent=2), encoding="utf-8")
+    write_html(diffs, str(outdir/"diff_docx.html"))
 
     print(json.dumps({
-        "html_report": str(out / "diff.html"),
-        "json": str(json_path),
-        "pdf_old_annot": str(out / "old_annotated.pdf"),
-        "pdf_new_annot": str(out / "new_annotated.pdf")
+        "html_report": str(outdir/"diff_docx.html"),
+        "json": str(outdir/"diff.json"),
+        "stats": {"old_sentences": len(old), "new_sentences": len(new), "diff_items": len(diffs)}
     }, ensure_ascii=False))
 
 if __name__ == "__main__":
-    old_pdf, new_pdf, out_dir = sys.argv[1], sys.argv[2], sys.argv[3]
-    main(old_pdf, new_pdf, out_dir)
+    main()
