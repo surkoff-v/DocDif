@@ -153,13 +153,29 @@ def main():
 
     diffs = align_sentence_lists(old, new)
 
-    (outdir/"diff.json").write_text(json.dumps(diffs, ensure_ascii=False, indent=2), encoding="utf-8")
-    write_html(diffs, str(outdir/"diff_docx.html"))
+    # (опционально) добавить имя файлов в каждый элемент (раскомментируй, если надо)
+    # old_name = pathlib.Path(args.old_pdf).name
+    # new_name = pathlib.Path(args.new_pdf).name
+    # for d in diffs:
+    #     d["old_file"] = old_name
+    #     d["new_file"] = new_name
+
+    meta = {
+        "old_file": pathlib.Path(args.old_pdf).name,
+        "new_file": pathlib.Path(args.new_pdf).name,
+    }
+
+    (outdir/"diff.json").write_text(
+        json.dumps({"meta": meta, "diffs": diffs}, ensure_ascii=False, indent=2),
+        encoding="utf-8"
+    )
+    write_html(diffs, str(outdir/"diff.html"))
 
     print(json.dumps({
-        "html_report": str(outdir/"diff_docx.html"),
+        "html_report": str(outdir/"diff.html"),
         "json": str(outdir/"diff.json"),
-        "stats": {"old_sentences": len(old), "new_sentences": len(new), "diff_items": len(diffs)}
+        "stats": {"old_sentences": len(old), "new_sentences": len(new), "diff_items": len(diffs)},
+        "meta": meta
     }, ensure_ascii=False))
 
 if __name__ == "__main__":
